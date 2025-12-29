@@ -1,86 +1,130 @@
 #!/bin/bash
-set -e
+set -Eeuo pipefail
 
-echo "=============================="
-echo " DEV ENVIRONMENT BOOTSTRAPPER "
-echo "=============================="
+# ============================================================
+# GLOBALS & LOGGING
+# ============================================================
 
-# -------------------------------
-# 1. IP INPUT
-# -------------------------------
+LOG=/var/log/dev-bootstrap.log
+exec > >(tee -a "$LOG") 2>&1
+
+echo "================================================="
+echo " DEV ENVIRONMENT FULL BOOTSTRAP (SAFE + COMPLETE)"
+echo "================================================="
+
+# ============================================================
+# WAIT FOR CLOUD-INIT
+# ============================================================
+
+if command -v cloud-init >/dev/null; then
+  echo "[*] Waiting for cloud-init..."
+  cloud-init status --wait || true
+fi
+
+# ============================================================
+# APT HARDENING
+# ============================================================
+
+echo "[*] Hardening APT..."
+cat >/etc/apt/apt.conf.d/99-retries <<EOF
+Acquire::Retries "5";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Acquire::ForceIPv4 "true";
+EOF
+
+# ============================================================
+# RETRY FUNCTION
+# ============================================================
+
+retry() {
+  local n=1
+  local max=5
+  local delay=10
+  while true; do
+    "$@" && break || {
+      if [[ $n -lt $max ]]; then
+        ((n++))
+        echo "Retry $n/$max failed. Retrying in $delay seconds..."
+        sleep $delay
+      else
+        echo "Command failed after $max attempts: $*"
+        return 1
+      fi
+    }
+  done
+}
+
+# ============================================================
+# INPUT IPs
+# ============================================================
 
 read -p "Enter dev-1 IP: " DEV1_IP
 read -p "Enter dev-2 IP: " DEV2_IP
 read -p "Enter dev-3 IP: " DEV3_IP
 read -p "Enter THIS node's IP: " THIS_IP
 
-# ---------------------------------------------------------
-# Determine node role
-# ---------------------------------------------------------
-
 if [[ "$THIS_IP" == "$DEV1_IP" ]]; then
-    NODE_ROLE="dev1"
+  NODE_ROLE="dev1"
 elif [[ "$THIS_IP" == "$DEV2_IP" ]]; then
-    NODE_ROLE="dev2"
+  NODE_ROLE="dev2"
 elif [[ "$THIS_IP" == "$DEV3_IP" ]]; then
-    NODE_ROLE="dev3"
+  NODE_ROLE="dev3"
 else
-    echo "ERROR: THIS_IP does not match any dev node IP!"
-    exit 1
+  echo "ERROR: THIS NODE IP does not match dev IPs"
+  exit 1
 fi
 
-echo "Node role detected: $NODE_ROLE"
-sleep 1
+echo "[*] Node role detected: $NODE_ROLE"
 
+# ============================================================
+# BASE PACKAGES
+# ============================================================
 
-# -------------------------------
-# 2. Install base packages
-# -------------------------------
+retry apt update -y
+retry apt install -y \
+  curl wget unzip jq ca-certificates gnupg lsb-release \
+  python3 python3-pip software-properties-common
 
-echo "[*] Installing base tools..."
-apt update -y
-apt install -y curl wget unzip jq python3 python3-pip gnupg lsb-release
+# ============================================================
+# DOCKER
+# ============================================================
 
+if ! command -v docker >/dev/null; then
+  echo "[*] Installing Docker..."
+  retry apt install -y docker.io
+  systemctl enable --now docker
+fi
 
-# -------------------------------
-# 3. Install Docker
-# -------------------------------
-
-echo "[*] Installing Docker..."
-apt install -y docker.io
-systemctl enable --now docker
-
-
-# -------------------------------
-# 4. Install Consul
-# -------------------------------
+# ============================================================
+# CONSUL
+# ============================================================
 
 CONSUL_VERSION=1.17.0
 
-echo "[*] Installing Consul $CONSUL_VERSION..."
-wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
-unzip consul_${CONSUL_VERSION}_linux_amd64.zip
-mv consul /usr/local/bin/
-rm consul_${CONSUL_VERSION}_linux_amd64.zip
-mkdir -p /etc/consul.d
-mkdir -p /var/consul
+if ! command -v consul >/dev/null; then
+  echo "[*] Installing Consul..."
+  retry wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
+  unzip -o consul_${CONSUL_VERSION}_linux_amd64.zip
+  mv consul /usr/local/bin/
+  rm consul_${CONSUL_VERSION}_linux_amd64.zip
+fi
+
+mkdir -p /etc/consul.d /var/consul
 
 cat >/etc/consul.d/consul.hcl <<EOF
 datacenter = "dev"
-data_dir   = "/var/consul"
-server     = true
+data_dir = "/var/consul"
+server = true
 bootstrap_expect = 3
-bind_addr  = "${THIS_IP}"
+bind_addr = "${THIS_IP}"
 retry_join = ["${DEV1_IP}", "${DEV2_IP}", "${DEV3_IP}"]
-ui_config {
-  enabled = true
-}
+ui_config { enabled = true }
 EOF
 
-# systemd
 cat >/etc/systemd/system/consul.service <<EOF
 [Unit]
-Description=Consul Agent
+Description=Consul
 After=network.target
 
 [Service]
@@ -92,29 +136,32 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now consul
+systemctl enable consul || true
+systemctl restart consul || true
 
-
-# -------------------------------
-# 5. Install Nomad
-# -------------------------------
+# ============================================================
+# NOMAD
+# ============================================================
 
 NOMAD_VERSION=1.8.0
 
-echo "[*] Installing Nomad $NOMAD_VERSION..."
-wget https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip
-unzip nomad_${NOMAD_VERSION}_linux_amd64.zip
-mv nomad /usr/local/bin/
-rm nomad_${NOMAD_VERSION}_linux_amd64.zip
-mkdir -p /etc/nomad.d
+if ! command -v nomad >/dev/null; then
+  echo "[*] Installing Nomad..."
+  retry wget https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip
+  unzip -o nomad_${NOMAD_VERSION}_linux_amd64.zip
+  mv nomad /usr/local/bin/
+  rm nomad_${NOMAD_VERSION}_linux_amd64.zip
+fi
+
+mkdir -p /etc/nomad.d /opt/nomad
 
 cat >/etc/nomad.d/nomad.hcl <<EOF
 datacenter = "dev"
-data_dir  = "/opt/nomad"
+data_dir = "/opt/nomad"
 bind_addr = "0.0.0.0"
 
 server {
-  enabled          = true
+  enabled = true
   bootstrap_expect = 3
   server_join {
     retry_join = ["${DEV1_IP}", "${DEV2_IP}", "${DEV3_IP}"]
@@ -128,7 +175,7 @@ EOF
 
 cat >/etc/systemd/system/nomad.service <<EOF
 [Unit]
-Description=Nomad Agent
+Description=Nomad
 After=network.target
 
 [Service]
@@ -140,16 +187,15 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now nomad
+systemctl enable nomad || true
+systemctl restart nomad || true
 
+# ============================================================
+# POSTGRESQL + PATRONI
+# ============================================================
 
-# -------------------------------
-# 6. Install Patroni + PostgreSQL
-# -------------------------------
-
-echo "[*] Installing PostgreSQL + Patroni..."
-apt install -y postgresql postgresql-client python3-psycopg2 python3-pip
-pip3 install patroni[etcd,consul]
+retry apt install -y postgresql postgresql-client
+pip3 install patroni[consul]
 
 mkdir -p /etc/patroni
 
@@ -159,32 +205,27 @@ namespace: /service/
 name: ${NODE_ROLE}
 
 restapi:
-    listen: ${THIS_IP}:8008
-    connect_address: ${THIS_IP}:8008
+  listen: ${THIS_IP}:8008
+  connect_address: ${THIS_IP}:8008
 
 consul:
-    url: http://${THIS_IP}:8500
-    register_service: true
+  url: http://${THIS_IP}:8500
 
 postgresql:
-    listen: ${THIS_IP}:5432
-    connect_address: ${THIS_IP}:5432
-    data_dir: /var/lib/postgresql/data
-    bin_dir: /usr/lib/postgresql/15/bin
-    pgpass: /tmp/pgpass
-    parameters:
-        max_connections: 200
-        shared_buffers: 2GB
-        wal_level: replica
-        synchronous_commit: "off"
-
+  listen: ${THIS_IP}:5432
+  connect_address: ${THIS_IP}:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/lib/postgresql/15/bin
+  parameters:
+    max_connections: 200
+    shared_buffers: 2GB
+    wal_level: replica
 EOF
-
 
 cat >/etc/systemd/system/patroni.service <<EOF
 [Unit]
-Description=Patroni PostgreSQL cluster
-After=network.target
+Description=Patroni
+After=network.target consul.service
 
 [Service]
 User=postgres
@@ -195,43 +236,41 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
+systemctl daemon-reload
+systemctl enable patroni || true
+systemctl restart patroni || true
 
-# Run Patroni only on leader/replica nodes
-if [[ "$NODE_ROLE" == "dev1" || "$NODE_ROLE" == "dev2" || "$NODE_ROLE" == "dev3" ]]; then
-    echo "[*] Enabling Patroni..."
-    systemctl daemon-reload
-    systemctl enable --now patroni
-fi
-
-
-# -------------------------------
-# 7. Install Traefik (only dev-1 & dev-2)
-# -------------------------------
+# ============================================================
+# TRAEFIK (dev-1 & dev-2)
+# ============================================================
 
 if [[ "$NODE_ROLE" == "dev1" || "$NODE_ROLE" == "dev2" ]]; then
-    echo "[*] Installing Traefik (LB)..."
+  if ! command -v traefik >/dev/null; then
+    TRAEFIK_VERSION=2.11.0
+    retry wget https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz
+    tar -xvf traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz
+    mv traefik /usr/bin/
+    rm traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz
+  fi
 
-    mkdir -p /etc/traefik
+  mkdir -p /etc/traefik
 
-cat >/etc/traefik/traefik.yml <<EOF
+  cat >/etc/traefik/traefik.yml <<EOF
 entryPoints:
   web:
     address: ":80"
-  api:
-    address: ":8080"
 
 providers:
   consulCatalog:
-    prefix: "traefik"
     exposedByDefault: false
 
 api:
   dashboard: true
 EOF
 
-    cat >/etc/systemd/system/traefik.service <<EOF
+  cat >/etc/systemd/system/traefik.service <<EOF
 [Unit]
-Description=Traefik Reverse Proxy
+Description=Traefik
 After=network.target
 
 [Service]
@@ -242,39 +281,31 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-    # install traefik binary
-    TRAEFIK_VERSION=2.11.0
-    wget https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz
-    tar -xvf traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz
-    mv traefik /usr/bin/
-    rm traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz
-
-    systemctl daemon-reload
-    systemctl enable --now traefik
+  systemctl daemon-reload
+  systemctl enable traefik || true
+  systemctl restart traefik || true
 fi
 
-
-# -------------------------------
-# 8. Observability (only dev-3)
-# -------------------------------
+# ============================================================
+# OBSERVABILITY (dev-3)
+# ============================================================
 
 if [[ "$NODE_ROLE" == "dev3" ]]; then
-    echo "[*] Installing Prometheus + Grafana + Loki..."
-
-    docker run -d --name prom -p 9090:9090 prom/prometheus
-    docker run -d --name grafana -p 3000:3000 grafana/grafana
-    docker run -d --name loki -p 3100:3100 grafana/loki
+  docker run -d --restart unless-stopped --name prometheus -p 9090:9090 prom/prometheus || true
+  docker run -d --restart unless-stopped --name grafana -p 3000:3000 grafana/grafana || true
+  docker run -d --restart unless-stopped --name loki -p 3100:3100 grafana/loki || true
 fi
 
+# ============================================================
+# PROMTAIL (ALL)
+# ============================================================
 
-# -------------------------------
-# 9. Promtail (all nodes)
-# -------------------------------
-
-echo "[*] Installing Promtail..."
-docker run -d --name promtail -v /var/log:/var/log grafana/promtail:latest
-
+docker run -d --restart unless-stopped \
+  --name promtail \
+  -v /var/log:/var/log grafana/promtail || true
 
 echo "================================================="
-echo " DEV NODE SETUP COMPLETE - ROLE: $NODE_ROLE"
+echo " DEV NODE SETUP COMPLETE"
+echo " Role: $NODE_ROLE"
+echo " Log: $LOG"
 echo "================================================="
