@@ -1,0 +1,89 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(
+      name: 'SERVICE',
+      choices: [
+        'auth-api',
+        'console-api',
+        'management-api',
+        'notification-api',
+        'gateway',
+        'ui'
+      ],
+      description: 'Service to deploy'
+    )
+
+    string(
+      name: 'BRANCH',
+      defaultValue: 'main',
+      description: 'Git branch to build'
+    )
+  }
+
+  environment {
+    IMAGE_TAG = "${params.BRANCH}-${env.BUILD_NUMBER}"
+    BASE_DIR  = "/opt/services"
+  }
+
+  stages {
+
+    stage("Build on all nodes") {
+      steps {
+        script {
+          def nodes = [
+            [ ip: "10.19.120.181", cred: "ssh-dev-181" ],
+            [ ip: "10.19.120.182", cred: "ssh-dev-182" ],
+            [ ip: "10.19.120.183", cred: "ssh-dev-183" ]
+          ]
+
+          for (n in nodes) {
+            withCredentials([
+              usernamePassword(
+                credentialsId: n.cred,
+                usernameVariable: 'SSH_USER',
+                passwordVariable: 'SSH_PASS'
+              )
+            ]) {
+              sh """
+                sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no $SSH_USER@${n.ip} '
+                  set -e
+                  cd ${BASE_DIR}/${params.SERVICE}
+
+                  git fetch origin
+                  git checkout ${params.BRANCH}
+                  git pull origin ${params.BRANCH}
+
+                  if [ -f pom.xml ]; then
+                    mvn clean package -DskipTests
+                  fi
+
+                  docker build -t ${params.SERVICE}:${IMAGE_TAG} .
+                  docker tag ${params.SERVICE}:${IMAGE_TAG} ${params.SERVICE}:dev
+                '
+              """
+            }
+          }
+        }
+      }
+    }
+
+    stage("Deploy via Nomad") {
+      steps {
+        sh """
+          nomad job run ${BASE_DIR}/nomad-jobs/${params.SERVICE}.nomad
+        """
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Deployment successful: ${params.SERVICE}:${IMAGE_TAG}"
+    }
+    failure {
+      echo "Deployment failed"
+    }
+  }
+}
