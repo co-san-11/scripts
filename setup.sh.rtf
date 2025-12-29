@@ -1,0 +1,288 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2865
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/bin/bash\
+set -e\
+\
+echo "=============================="\
+echo " DEV ENVIRONMENT BOOTSTRAPPER "\
+echo "=============================="\
+\
+# -------------------------------\
+# 1. IP INPUT\
+# -------------------------------\
+\
+read -p "Enter dev-1 IP: " DEV1_IP\
+read -p "Enter dev-2 IP: " DEV2_IP\
+read -p "Enter dev-3 IP: " DEV3_IP\
+read -p "Enter THIS node's IP: " THIS_IP\
+\
+# ---------------------------------------------------------\
+# Determine node role\
+# ---------------------------------------------------------\
+\
+if [[ "$THIS_IP" == "$DEV1_IP" ]]; then\
+    NODE_ROLE="dev1"\
+elif [[ "$THIS_IP" == "$DEV2_IP" ]]; then\
+    NODE_ROLE="dev2"\
+elif [[ "$THIS_IP" == "$DEV3_IP" ]]; then\
+    NODE_ROLE="dev3"\
+else\
+    echo "ERROR: THIS_IP does not match any dev node IP!"\
+    exit 1\
+fi\
+\
+echo "Node role detected: $NODE_ROLE"\
+sleep 1\
+\
+\
+# -------------------------------\
+# 2. Install base packages\
+# -------------------------------\
+\
+echo "[*] Installing base tools..."\
+apt update -y\
+apt install -y curl wget unzip jq python3 python3-pip gnupg lsb-release\
+\
+\
+# -------------------------------\
+# 3. Install Docker\
+# -------------------------------\
+\
+echo "[*] Installing Docker..."\
+apt install -y docker.io\
+systemctl enable --now docker\
+\
+\
+# -------------------------------\
+# 4. Install Consul\
+# -------------------------------\
+\
+CONSUL_VERSION=1.17.0\
+\
+echo "[*] Installing Consul $CONSUL_VERSION..."\
+wget https://releases.hashicorp.com/consul/$\{CONSUL_VERSION\}/consul_$\{CONSUL_VERSION\}_linux_amd64.zip\
+unzip consul_$\{CONSUL_VERSION\}_linux_amd64.zip\
+mv consul /usr/local/bin/\
+rm consul_$\{CONSUL_VERSION\}_linux_amd64.zip\
+mkdir -p /etc/consul.d\
+mkdir -p /var/consul\
+\
+cat >/etc/consul.d/consul.hcl <<EOF\
+datacenter = "dev"\
+data_dir   = "/var/consul"\
+server     = true\
+bootstrap_expect = 3\
+bind_addr  = "$\{THIS_IP\}"\
+retry_join = ["$\{DEV1_IP\}", "$\{DEV2_IP\}", "$\{DEV3_IP\}"]\
+ui_config \{\
+  enabled = true\
+\}\
+EOF\
+\
+# systemd\
+cat >/etc/systemd/system/consul.service <<EOF\
+[Unit]\
+Description=Consul Agent\
+After=network.target\
+\
+[Service]\
+ExecStart=/usr/local/bin/consul agent -config-dir=/etc/consul.d\
+Restart=always\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+systemctl daemon-reload\
+systemctl enable --now consul\
+\
+\
+# -------------------------------\
+# 5. Install Nomad\
+# -------------------------------\
+\
+NOMAD_VERSION=1.8.0\
+\
+echo "[*] Installing Nomad $NOMAD_VERSION..."\
+wget https://releases.hashicorp.com/nomad/$\{NOMAD_VERSION\}/nomad_$\{NOMAD_VERSION\}_linux_amd64.zip\
+unzip nomad_$\{NOMAD_VERSION\}_linux_amd64.zip\
+mv nomad /usr/local/bin/\
+rm nomad_$\{NOMAD_VERSION\}_linux_amd64.zip\
+mkdir -p /etc/nomad.d\
+\
+cat >/etc/nomad.d/nomad.hcl <<EOF\
+datacenter = "dev"\
+data_dir  = "/opt/nomad"\
+bind_addr = "0.0.0.0"\
+\
+server \{\
+  enabled          = true\
+  bootstrap_expect = 3\
+  server_join \{\
+    retry_join = ["$\{DEV1_IP\}", "$\{DEV2_IP\}", "$\{DEV3_IP\}"]\
+  \}\
+\}\
+\
+client \{\
+  enabled = true\
+\}\
+EOF\
+\
+cat >/etc/systemd/system/nomad.service <<EOF\
+[Unit]\
+Description=Nomad Agent\
+After=network.target\
+\
+[Service]\
+ExecStart=/usr/local/bin/nomad agent -config=/etc/nomad.d\
+Restart=always\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+systemctl daemon-reload\
+systemctl enable --now nomad\
+\
+\
+# -------------------------------\
+# 6. Install Patroni + PostgreSQL\
+# -------------------------------\
+\
+echo "[*] Installing PostgreSQL + Patroni..."\
+apt install -y postgresql postgresql-client python3-psycopg2 python3-pip\
+pip3 install patroni[etcd,consul]\
+\
+mkdir -p /etc/patroni\
+\
+cat >/etc/patroni/patroni.yml <<EOF\
+scope: dev-cluster\
+namespace: /service/\
+name: $\{NODE_ROLE\}\
+\
+restapi:\
+    listen: $\{THIS_IP\}:8008\
+    connect_address: $\{THIS_IP\}:8008\
+\
+consul:\
+    url: http://$\{THIS_IP\}:8500\
+    register_service: true\
+\
+postgresql:\
+    listen: $\{THIS_IP\}:5432\
+    connect_address: $\{THIS_IP\}:5432\
+    data_dir: /var/lib/postgresql/data\
+    bin_dir: /usr/lib/postgresql/15/bin\
+    pgpass: /tmp/pgpass\
+    parameters:\
+        max_connections: 200\
+        shared_buffers: 2GB\
+        wal_level: replica\
+        synchronous_commit: "off"\
+\
+EOF\
+\
+\
+cat >/etc/systemd/system/patroni.service <<EOF\
+[Unit]\
+Description=Patroni PostgreSQL cluster\
+After=network.target\
+\
+[Service]\
+User=postgres\
+ExecStart=/usr/local/bin/patroni /etc/patroni/patroni.yml\
+Restart=always\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+\
+# Run Patroni only on leader/replica nodes\
+if [[ "$NODE_ROLE" == "dev1" || "$NODE_ROLE" == "dev2" || "$NODE_ROLE" == "dev3" ]]; then\
+    echo "[*] Enabling Patroni..."\
+    systemctl daemon-reload\
+    systemctl enable --now patroni\
+fi\
+\
+\
+# -------------------------------\
+# 7. Install Traefik (only dev-1 & dev-2)\
+# -------------------------------\
+\
+if [[ "$NODE_ROLE" == "dev1" || "$NODE_ROLE" == "dev2" ]]; then\
+    echo "[*] Installing Traefik (LB)..."\
+\
+    mkdir -p /etc/traefik\
+\
+cat >/etc/traefik/traefik.yml <<EOF\
+entryPoints:\
+  web:\
+    address: ":80"\
+  api:\
+    address: ":8080"\
+\
+providers:\
+  consulCatalog:\
+    prefix: "traefik"\
+    exposedByDefault: false\
+\
+api:\
+  dashboard: true\
+EOF\
+\
+    cat >/etc/systemd/system/traefik.service <<EOF\
+[Unit]\
+Description=Traefik Reverse Proxy\
+After=network.target\
+\
+[Service]\
+ExecStart=/usr/bin/traefik --configFile=/etc/traefik/traefik.yml\
+Restart=always\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+    # install traefik binary\
+    TRAEFIK_VERSION=2.11.0\
+    wget https://github.com/traefik/traefik/releases/download/v$\{TRAEFIK_VERSION\}/traefik_$\{TRAEFIK_VERSION\}_linux_amd64.tar.gz\
+    tar -xvf traefik_$\{TRAEFIK_VERSION\}_linux_amd64.tar.gz\
+    mv traefik /usr/bin/\
+    rm traefik_$\{TRAEFIK_VERSION\}_linux_amd64.tar.gz\
+\
+    systemctl daemon-reload\
+    systemctl enable --now traefik\
+fi\
+\
+\
+# -------------------------------\
+# 8. Observability (only dev-3)\
+# -------------------------------\
+\
+if [[ "$NODE_ROLE" == "dev3" ]]; then\
+    echo "[*] Installing Prometheus + Grafana + Loki..."\
+\
+    docker run -d --name prom -p 9090:9090 prom/prometheus\
+    docker run -d --name grafana -p 3000:3000 grafana/grafana\
+    docker run -d --name loki -p 3100:3100 grafana/loki\
+fi\
+\
+\
+# -------------------------------\
+# 9. Promtail (all nodes)\
+# -------------------------------\
+\
+echo "[*] Installing Promtail..."\
+docker run -d --name promtail -v /var/log:/var/log grafana/promtail:latest\
+\
+\
+echo "================================================="\
+echo " DEV NODE SETUP COMPLETE - ROLE: $NODE_ROLE"\
+echo "================================================="\
+}
