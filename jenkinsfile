@@ -24,7 +24,6 @@ pipeline {
 
   environment {
     IMAGE_TAG = "${params.BRANCH}-${env.BUILD_NUMBER}"
-    BASE_DIR  = "/opt/services"
   }
 
   stages {
@@ -49,8 +48,18 @@ pipeline {
               sh """
                 sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no $SSH_USER@${n.ip} '
                   set -e
-                  cd ${BASE_DIR}/${params.SERVICE}
 
+                  BASE_DIR="/home/$SSH_USER/workspace"
+                  SERVICE="${params.SERVICE}"
+
+                  mkdir -p $BASE_DIR
+                  cd $BASE_DIR
+
+                  if [ ! -d "$SERVICE" ]; then
+                    git clone https://your-git/${SERVICE}.git
+                  fi
+
+                  cd $SERVICE
                   git fetch origin
                   git checkout ${params.BRANCH}
                   git pull origin ${params.BRANCH}
@@ -72,7 +81,7 @@ pipeline {
     stage("Deploy via Nomad") {
       steps {
         sh """
-          nomad job run ${BASE_DIR}/nomad-jobs/${params.SERVICE}.nomad
+          nomad job run /home/${env.USER}/workspace/nomad-jobs/${params.SERVICE}.nomad
         """
       }
     }
