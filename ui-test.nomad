@@ -1,0 +1,18 @@
+job "ui-test" {
+  datacenters = ["dev"]
+
+  group "ui" {
+    task "ui" {
+      driver = "docker"
+
+      config {
+        image = "cule-ui:dev"
+      }
+
+      resources {
+        cpu    = 200
+        memory = 256
+      }
+    }
+  }
+}
