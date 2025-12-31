@@ -3,12 +3,7 @@ job "ui-test" {
 
   group "ui" {
     network {
-      mode = "bridge"
-
-      port "http" {
-        to = 80
-        static = 8085
-      }
+      mode = "host"
     }
 
     task "ui" {
