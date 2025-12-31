@@ -11,7 +11,6 @@ job "ui-test" {
 
       config {
         image = "cule-ui:dev"
-        ports = ["http"]
       }
 
       resources {
