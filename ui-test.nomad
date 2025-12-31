@@ -11,6 +11,7 @@ job "ui-test" {
 
       config {
         image = "cule-ui:dev"
+        network_mode = "host"
       }
 
       resources {
